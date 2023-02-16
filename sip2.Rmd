@@ -1,0 +1,222 @@
+---
+title: "SIP2"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(mice) # for imputation
+library(mlbench) # for model evaluation
+library(caret) # for model training
+library(FNN)
+library(dplyr)
+library(stringr)
+library(rpart)
+```
+
+# Data shape
+
+Let's load the data. This csv file has some of the columns that are empty that 
+need to be treated as NA. For example, we know that gender column cannot be 
+empty. We can take the help of `read.csv` function to mark the data as `NA` for 
+us by providing the `na.strings` argument to `read.csv`
+
+```{r readdata}
+train_retention <- read.csv("./HRRetention_train.csv", header=TRUE, sep=",", na.strings=c("","NA"))
+test_retention <- read.csv("./HRRetention_test.csv", header=TRUE, sep=",", na.strings=c("","NA"))
+```
+
+```{Split}
+sample <- sample.int(n = nrow(data), size = floor(.75*nrow(data)), replace = F)
+train_retention <- data[sample, ]
+test_retention  <- data[-sample, ]
+```
+
+This markdown file takes HR retention data, imputes missing data and predicts 
+which employees are likely to leave.
+
+Let's first take a look at what the data looks like
+
+```{r retention}
+str(train_retention)
+```
+
+The data needs to be sanitized so that we can use it for analysis. 
+
+```{r sanitizing}
+sanitize <- function(data) {
+ data %>%
+    mutate(gender = case_when(
+      gender == 'Male' ~ 0,
+      gender == 'Female' ~ 1,
+      gender == 'Other' ~ 2,
+      )) %>%
+    mutate(relevent_experience = case_when(
+      relevent_experience == 'Has relevent experience' ~ 0,
+      relevent_experience == 'No relevent experience' ~ 1,
+      )) %>%
+    mutate(enrolled_university = case_when(
+      enrolled_university == 'Full time course' ~ 0,
+      enrolled_university == 'Part time course' ~ 1,
+      )) %>%
+    mutate(education_level = case_when(
+      education_level == 'Phd' ~ 0,
+      education_level == 'Masters' ~ 1,
+      education_level == 'Graduate' ~ 2,
+      education_level == 'High School' ~ 3,
+      education_level == 'Primary School' ~ 4,
+      )) %>%
+    mutate(major_discipline = case_when(
+      major_discipline == 'Arts' ~ 0,
+      major_discipline == 'Business Degree' ~ 1,
+      major_discipline == 'Humanities' ~ 2,
+      major_discipline == 'No Major' ~ 3,
+      major_discipline == 'Other' ~ 4,
+      major_discipline == 'STEM' ~ 5,
+      )) %>%
+    mutate(experience = case_when(
+      experience == '<1' ~ 0,
+      experience == '>20' ~ 21,
+      ))  %>%
+    mutate(company_size = case_when(
+      company_size == '<10' ~ 0,
+      company_size == '>20' ~ 1,
+      company_size == 'Oct-49' ~ 2, #looks like the data was incorrectly recorded 20-49
+      company_size == '50-99' ~ 3,
+      company_size == '100-500' ~ 4,
+      company_size == '500-999' ~ 5,
+      company_size == '1000-4999' ~ 6,
+      company_size == '5000-9999' ~ 7,
+      )) %>%
+    mutate(company_type = case_when(
+      company_type == 'Early Stage Startup' ~ 0,
+      company_type == 'Funded Startup' ~ 1,
+      company_type == 'NGO' ~ 2, 
+      company_type == 'Other' ~ 3,
+      company_type == 'Public Sector' ~ 4,
+      company_type == 'Pvt Ltd' ~ 5,
+      )) %>%
+    mutate(last_new_job = case_when(
+      last_new_job == '>4' ~ 5,
+      last_new_job == 'never' ~ 6,
+      )) %>%
+    mutate(city = strtoi(str_replace(city, "city_", "")))
+}
+
+train_retention_sanitized <- sanitize(train_retention)
+test_retention_sanitized <- sanitize(test_retention)
+```
+
+# Missingness in data
+
+Let's get the count of data missing in each column
+
+```{r missingcounts}
+colSums(is.na(train_retention))
+```
+
+Let's get the percentage of data that is missing i.e. represented as NA
+
+```{r missingness}
+missingness <- function(column) (sum(is.na(column))/length(column)*100)
+apply(train_retention, 2, missingness)
+```
+
+We see that the largest proportion of missing data is for `company_type`.
+
+Let' plot the pattern to get a visual representation
+
+```{r missingnessplot}
+md.pattern(train_retention, plot = TRUE)
+```
+
+Let's look at pairs of missing data. The `md.pairs` function allows us to do 
+this. The output is 4 distinct tables - that show the various combinations of 
+which column is missing when the other is missing
+
+```{r missingpairs}
+md.pairs(train_retention)
+```
+
+# Imputing the missing data
+
+Imputation fills missing data using different mechanisms.
+Let's impute the data to fill the gaps in data for `train_retention`first using
+`mean` method
+
+```{r imputation}
+train_imp <- mice(train_retention_sanitized,
+            c('pmm', 'pmm', 'pmm', 'pmm', 'pmm', 'pmm', 'cart', 'cart', 'cart', 'cart', 'pmm', 'cart',                       'pmm', 'pmm'),
+            m=5, maxit=1, seed=42, print= F)
+test_imp <- mice(test_retention_sanitized,
+            c('pmm', 'pmm', 'pmm', 'pmm', 'pmm', 'pmm', 'cart', 'cart', 'cart', 'cart', 'pmm', 'cart',                       'pmm'),
+            m=5, maxit=1, seed=42, print= F)
+print(train_imp)
+print(test_imp)
+```
+
+
+Let's complete the data using the imputation
+
+```{r complete}
+train_imputed <- complete(train_imp, action = "long")
+test_imputed <- complete(test_imp, action = "long")
+```
+
+Let's check the quality of the imputed data
+
+```{r imputation_quality}
+xyplot(train_imp, experience ~ target | .imp, pch = 20, cex=1.4)
+```
+
+# Modelling who will leave
+
+Let's first normalize the data so that modelling will be faster
+
+```{r normalize}
+set.seed(42)
+norm.values <- preProcess(train_imputed, method=c("center", "scale"))  
+train.norm <- predict(norm.values, train_imputed)
+norm.values <- preProcess(test_imputed, method=c("center", "scale"))  
+test.norm <- predict(norm.values, test_imputed)
+```
+
+Let's first try out knn
+
+```{r knn}
+nn <- knn(train = train.norm[,2:13],
+          test = test.norm[,2:13],
+          cl = train.norm$target,
+          k=2
+        )
+```
+
+Let's try logistical regression
+
+```{r gender_target_lm_fit_before_imputation}
+fit <- lm(formula = target ~ ., data = train.norm)
+summary(fit)
+
+fit_imputed <- with(test.norm, fit)
+summary(fit_imputed)
+```
+
+Let's do Classification and Regression Tree
+
+```{r Use rpart.control to specify depth & method to specify classification}
+
+
+
+class.tree <- rpart(target ~ ., data = train.norm, 
+                    control = rpart.control(maxdepth = 14), method = "class")
+#Generating classification tree
+default.ct <- rpart(target ~ ., data = train.norm, method = "class")
+# for Training set
+default.ct.point.pred.train <- predict(default.ct, 
+                                       data = train.df, 
+                                       type = "class")
+confusionMatrix(default.ct.point.pred.train, as.factor(train.norm$target))
+
+```
+Conclusion: The Classification and Regression model and the binary logistic regression model are the clearly not predictors for employee leaving company since it shows negative class. So it is favourable to go with KNN for predictions.
